@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Confidential Voting — FHEVM</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="header-inner">
+          <div class="logo">
+            <span class="logo-icon">🔒</span>
+            <div class="logo-text">
+              <span class="logo-title">Confidential Voting</span>
+              <span class="logo-sub">Powered by FHEVM · Sepolia</span>
+            </div>
+          </div>
+          <div class="header-right">
+            <div id="wallet-status" class="wallet-status" style="display:none">
+              <div class="wallet-dot"></div>
+              <span id="wallet-addr"></span>
+            </div>
+            <button id="connect-btn" class="btn btn-primary">Connect Wallet</button>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <div id="network-warning" class="alert alert-warning" style="display:none">
+          ⚠️ Please switch to <strong>Sepolia</strong> testnet to use this app.
+          <button id="switch-network-btn" class="btn btn-sm btn-outline">Switch Network</button>
+        </div>
+
+        <div id="not-connected" class="hero">
+          <div class="hero-icon">🔒</div>
+          <h1>Private Voting on Ethereum</h1>
+          <p>Cast encrypted votes using Fully Homomorphic Encryption. Only the final tally is ever revealed — individual votes remain private forever.</p>
+          <button id="hero-connect-btn" class="btn btn-primary btn-lg">Connect Wallet</button>
+        </div>
+
+        <div id="content" style="display:none">
+          <!-- Owner Panel -->
+          <section id="owner-panel" style="display:none" class="owner-section">
+            <div class="panel">
+              <div class="panel-header">
+                <span class="badge badge-owner">Owner</span>
+                <h2>Create Proposal</h2>
+              </div>
+              <div class="create-form">
+                <input
+                  id="proposal-name"
+                  type="text"
+                  placeholder="e.g. Should we upgrade the protocol?"
+                  class="input"
+                  maxlength="120"
+                />
+                <button id="create-proposal-btn" class="btn btn-primary">+ Create</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- Proposals -->
+          <section class="proposals-section">
+            <div class="section-header">
+              <h2>Proposals</h2>
+              <button id="refresh-btn" class="btn btn-ghost btn-sm">↻ Refresh</button>
+            </div>
+            <div id="proposals-grid" class="proposals-grid"></div>
+            <div id="no-proposals" class="empty-state" style="display:none">
+              <div class="empty-icon">📋</div>
+              <p>No proposals yet.</p>
+              <p class="text-muted">The contract owner can create a proposal above.</p>
+            </div>
+            <div id="proposals-loading" class="loading-state">
+              <div class="spinner"></div>
+              <p>Loading proposals…</p>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <!-- Toast container -->
+      <div id="toast-container"></div>
+
+      <!-- FHE loading overlay -->
+      <div id="fhe-overlay" class="fhe-overlay" style="display:none">
+        <div class="fhe-modal">
+          <div class="fhe-spinner"></div>
+          <div id="fhe-overlay-title" class="fhe-title">Processing…</div>
+          <div id="fhe-overlay-msg" class="fhe-msg">FHE operations take 5–30 seconds on Sepolia.</div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+import { defineConfig } from "vite";
+import wasm from "vite-plugin-wasm";
+import topLevelAwait from "vite-plugin-top-level-await";
+import { nodePolyfills } from "vite-plugin-node-polyfills";
+
+export default defineConfig({
+  base: "/Confidential-voting/",
+  plugins: [
+    wasm(),
+    topLevelAwait(),
+    nodePolyfills({ include: ["buffer", "process"] }),
+  ],
+  worker: {
+    format: "es",
+    plugins: () => [wasm(), topLevelAwait()],
+  },
+  optimizeDeps: {
+    exclude: ["@zama-fhe/relayer-sdk"],
+  },
+  build: {
+    target: "esnext",
+  },
+});
