@@ -1,6 +1,16 @@
 import { useState, useEffect, useRef } from "react";
 import { BrowserProvider, Contract, ethers } from "ethers";
-import { createInstance, SepoliaConfig } from "@zama-fhe/relayer-sdk/web";
+// SDK loaded from local bundle — no relayer URL dependency for WASM init
+let createInstance = null;
+let SepoliaConfig  = null;
+
+async function loadSDK() {
+  if (createInstance) return;
+  const m = await import("./sdk-bundle.js");
+  createInstance = m.createInstance;
+  SepoliaConfig  = m.SepoliaConfig;
+  if (m.initSDK) await m.initSDK();
+}
 
 const CONTRACT_ADDRESS = "0x227189c0D8A1f732242d57b6F6ca776fcf14B1D8";
 const SEPOLIA_CHAIN_ID = 11155111;
@@ -165,7 +175,11 @@ export default function App() {
 
   async function getFhevmInstance() {
     if (fhevmRef.current) return fhevmRef.current;
-    fhevmRef.current = await createInstance({ ...SepoliaConfig, network: window.ethereum });
+    await loadSDK();
+    fhevmRef.current = await createInstance({
+      ...SepoliaConfig,
+      network: "https://ethereum-sepolia-rpc.publicnode.com",
+    });
     return fhevmRef.current;
   }
 
