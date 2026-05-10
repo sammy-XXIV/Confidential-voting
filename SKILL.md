@@ -1269,7 +1269,283 @@ closeFheModal();
 
 ---
 
-## 28. Complete Error Lookup Table
+## 28. fhevm-lint.js — Contract Auditor
+
+Save as `fhevm-lint.js` in your project root. Run with `node fhevm-lint.js contracts/`.
+Checks every anti-pattern in this SKILL.md. Fix all ERRORs before deploying to Sepolia.
+
+```javascript
+#!/usr/bin/env node
+// fhevm-lint.js — FHEVM contract static auditor
+// Usage: node fhevm-lint.js contracts/
+// Checks for all anti-patterns documented in SKILL.md
+
+import { readFileSync, readdirSync, statSync } from 'fs';
+import { join, extname } from 'path';
+
+const RED    = '\x1b[31m';
+const YELLOW = '\x1b[33m';
+const GREEN  = '\x1b[32m';
+const RESET  = '\x1b[0m';
+
+const rules = [
+  {
+    id: 'NO_INLINE_ZERO',
+    level: 'ERROR',
+    desc: 'Inline FHE.asEuint64(0) — use _encryptedZero from constructor (SKILL.md §4)',
+    // matches FHE.asEuint64(0) that is NOT inside a constructor body
+    test: (src) => {
+      const lines = src.split('\n');
+      const issues = [];
+      let inConstructor = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/constructor\s*\(/.test(line)) inConstructor++;
+        if (inConstructor && line.includes('{')) inConstructor++;
+        if (inConstructor && line.includes('}')) { inConstructor--; continue; }
+        if (!inConstructor && /FHE\.asEuint\d+\(\s*0\s*\)/.test(line))
+          issues.push({ line: i + 1, text: line.trim() });
+      }
+      return issues;
+    },
+  },
+  {
+    id: 'NO_FHE_DIV',
+    level: 'ERROR',
+    desc: 'FHE.div does not exist — use cross-multiplication (SKILL.md §5)',
+    test: (src) => matchLines(src, /FHE\.div\s*\(/),
+  },
+  {
+    id: 'NO_REQUIRE_EBOOL',
+    level: 'ERROR',
+    desc: 'require() on encrypted boolean — use FHE.select instead (SKILL.md §21)',
+    test: (src) => matchLines(src, /require\s*\(\s*FHE\./),
+  },
+  {
+    id: 'VIEW_WITH_FHE_ALLOW',
+    level: 'ERROR',
+    desc: 'view function contains FHE.allow — FHE.allow modifies state, remove view (SKILL.md §13)',
+    test: (src) => {
+      const issues = [];
+      const fns = src.split(/function\s+/);
+      let lineOffset = 0;
+      for (const fn of fns) {
+        const head = fn.split('{')[0];
+        if (/\bview\b/.test(head) && /FHE\.allow/.test(fn.split('}')[0])) {
+          const match = src.indexOf('function ' + fn.slice(0, 30));
+          const lineNum = src.slice(0, match).split('\n').length;
+          issues.push({ line: lineNum, text: ('function ' + fn.slice(0, 60)).trim() + '…' });
+        }
+        lineOffset += fn.split('\n').length;
+      }
+      return issues;
+    },
+  },
+  {
+    id: 'MISSING_ALLOW_TRANSIENT',
+    level: 'ERROR',
+    desc: 'confidentialTransferFrom called without FHE.allowTransient before it (SKILL.md §6)',
+    test: (src) => {
+      const issues = [];
+      const lines = src.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (/confidentialTransferFrom/.test(lines[i])) {
+          const prev = lines.slice(Math.max(0, i - 5), i).join('\n');
+          if (!/FHE\.allowTransient/.test(prev))
+            issues.push({ line: i + 1, text: lines[i].trim() });
+        }
+      }
+      return issues;
+    },
+  },
+  {
+    id: 'UNCAPTURED_TRANSFER',
+    level: 'ERROR',
+    desc: 'confidentialTransferFrom return value not captured — use received = transferFrom(...) (SKILL.md §8)',
+    test: (src) => matchLines(src, /^\s*(?:\w+\.)?confidentialTransferFrom\s*\(/),
+  },
+  {
+    id: 'ERC20_APPROVE_ON_CWETH',
+    level: 'ERROR',
+    desc: 'approve() on confidential token — ERC-7984 uses setOperator() (SKILL.md §8)',
+    test: (src) => matchLines(src, /\.approve\s*\(\s*(?:CONTRACT|contract|address)/i),
+  },
+  {
+    id: 'STALE_HANDLE',
+    level: 'ERROR',
+    desc: 'FHE op result assigned to storage without FHE.allowThis — stale handle (SKILL.md §20)',
+    test: (src) => {
+      const issues = [];
+      const lines = src.split('\n');
+      const fheOps = /= FHE\.(add|sub|mul|select|min|max|and|or|not|shl|shr)\(/;
+      for (let i = 0; i < lines.length; i++) {
+        if (fheOps.test(lines[i]) && /\._\w+\s*=/.test(lines[i])) {
+          const next5 = lines.slice(i + 1, i + 4).join('\n');
+          if (!/FHE\.allowThis/.test(next5))
+            issues.push({ line: i + 1, text: lines[i].trim() });
+        }
+      }
+      return issues;
+    },
+  },
+  {
+    id: 'MISSING_ZAMA_CONFIG',
+    level: 'ERROR',
+    desc: 'Contract does not inherit ZamaEthereumConfig (SKILL.md §4)',
+    test: (src) => {
+      if (!/contract\s+\w+/.test(src)) return [];
+      if (/is\s+.*ZamaEthereumConfig/.test(src)) return [];
+      if (!/import.*FHE\.sol/.test(src)) return []; // not an FHE contract
+      return [{ line: 1, text: 'Missing: contract X is ZamaEthereumConfig' }];
+    },
+  },
+  {
+    id: 'NO_ENCRYPTED_ZERO_IN_CONSTRUCTOR',
+    level: 'WARN',
+    desc: 'Uses FHE comparisons but no _encryptedZero in constructor (SKILL.md §4)',
+    test: (src) => {
+      if (!/FHE\.(eq|ne|lt|le|gt|ge)\(/.test(src)) return [];
+      if (/constructor[\s\S]*?FHE\.asEuint\d+\(\s*0\s*\)/.test(src)) return [];
+      return [{ line: 1, text: 'Add _encryptedZero = FHE.asEuint64(0) to constructor' }];
+    },
+  },
+  {
+    id: 'UNSAFE_SUBTRACTION',
+    level: 'WARN',
+    desc: 'FHE.sub without FHE.min guard — underflow risk (SKILL.md §5)',
+    test: (src) => {
+      const issues = [];
+      const lines = src.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (/FHE\.sub\(/.test(lines[i])) {
+          const prev = lines.slice(Math.max(0, i - 3), i).join('\n');
+          if (!/FHE\.min\(/.test(prev) && !/FHE\.min\(/.test(lines[i]))
+            issues.push({ line: i + 1, text: lines[i].trim() });
+        }
+      }
+      return issues;
+    },
+  },
+  {
+    id: 'EUINT_IN_ABI',
+    level: 'WARN',
+    desc: 'euint type in ABI string — ethers.js needs bytes32 (SKILL.md §16)',
+    test: (src) => matchLines(src, /['"`]function\s+\w+\([^)]*euint/),
+  },
+  {
+    id: 'MISSING_MAKE_PUBLICLY_DECRYPTABLE',
+    level: 'WARN',
+    desc: 'revealResults-like function uses FHE.allow(handle, owner) — use FHE.makePubliclyDecryptable for public results (SKILL.md §33)',
+    test: (src) => {
+      const issues = [];
+      const lines = src.split('\n');
+      let inReveal = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (/function\s+(reveal|disclose|publish)/i.test(lines[i])) inReveal = true;
+        if (inReveal && /FHE\.allow\(/.test(lines[i]) && !/makePubliclyDecryptable/.test(src))
+          issues.push({ line: i + 1, text: lines[i].trim() });
+        if (inReveal && /^\s*\}/.test(lines[i])) inReveal = false;
+      }
+      return issues;
+    },
+  },
+];
+
+function matchLines(src, regex) {
+  const issues = [];
+  src.split('\n').forEach((line, i) => {
+    if (regex.test(line)) issues.push({ line: i + 1, text: line.trim() });
+  });
+  return issues;
+}
+
+function lintFile(filePath) {
+  const src = readFileSync(filePath, 'utf8');
+  const findings = [];
+  for (const rule of rules) {
+    const hits = rule.test(src);
+    for (const hit of hits)
+      findings.push({ ...rule, ...hit, file: filePath });
+  }
+  return findings;
+}
+
+function collectSolFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) files.push(...collectSolFiles(full));
+    else if (extname(full) === '.sol') files.push(full);
+  }
+  return files;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+const target = process.argv[2] || 'contracts';
+const files  = statSync(target).isDirectory() ? collectSolFiles(target) : [target];
+
+let errors = 0, warnings = 0;
+
+for (const file of files) {
+  const findings = lintFile(file);
+  if (findings.length === 0) {
+    console.log(`${GREEN}✓${RESET} ${file}`);
+    continue;
+  }
+  console.log(`\n${file}`);
+  for (const f of findings) {
+    const color = f.level === 'ERROR' ? RED : YELLOW;
+    const icon  = f.level === 'ERROR' ? '✗' : '⚠';
+    console.log(`  ${color}${icon} [${f.id}] Line ${f.line}: ${f.desc}${RESET}`);
+    console.log(`    → ${f.text}`);
+    if (f.level === 'ERROR') errors++;
+    else warnings++;
+  }
+}
+
+console.log(`\n${'─'.repeat(60)}`);
+if (errors === 0 && warnings === 0) {
+  console.log(`${GREEN}All checks passed.${RESET}`);
+} else {
+  if (errors)   console.log(`${RED}${errors} error(s) — fix before deploying${RESET}`);
+  if (warnings) console.log(`${YELLOW}${warnings} warning(s) — review before deploying${RESET}`);
+}
+process.exit(errors > 0 ? 1 : 0);
+```
+
+### Usage
+
+```bash
+# Lint all contracts in contracts/ folder
+node fhevm-lint.js contracts/
+
+# Lint a single file
+node fhevm-lint.js contracts/ConfidentialVoting.sol
+```
+
+### What It Checks
+
+| Rule | Level | Anti-pattern |
+|------|-------|--------------|
+| `NO_INLINE_ZERO` | ERROR | `FHE.asEuint64(0)` outside constructor |
+| `NO_FHE_DIV` | ERROR | `FHE.div(...)` call (doesn't exist) |
+| `NO_REQUIRE_EBOOL` | ERROR | `require(FHE.xxx(...))` |
+| `VIEW_WITH_FHE_ALLOW` | ERROR | `view` function containing `FHE.allow` |
+| `MISSING_ALLOW_TRANSIENT` | ERROR | `confidentialTransferFrom` without prior `FHE.allowTransient` |
+| `UNCAPTURED_TRANSFER` | ERROR | `confidentialTransferFrom` return value discarded |
+| `ERC20_APPROVE_ON_CWETH` | ERROR | `.approve(contract...)` on confidential token |
+| `STALE_HANDLE` | ERROR | FHE op on storage without `FHE.allowThis` after |
+| `MISSING_ZAMA_CONFIG` | ERROR | Contract missing `is ZamaEthereumConfig` |
+| `NO_ENCRYPTED_ZERO_IN_CONSTRUCTOR` | WARN | Uses FHE comparisons, no `_encryptedZero` in constructor |
+| `UNSAFE_SUBTRACTION` | WARN | `FHE.sub` without `FHE.min` guard |
+| `EUINT_IN_ABI` | WARN | `euint` type in ethers.js ABI string |
+| `MISSING_MAKE_PUBLICLY_DECRYPTABLE` | WARN | Reveal function uses `FHE.allow` instead of `makePubliclyDecryptable` |
+
+Exit code `1` if any ERRORs — use in CI to block deploys.
+
+---
+
+## 29. Complete Error Lookup Table
 
 Every error you'll hit on FHEVM — cause and fix in one place.
 
