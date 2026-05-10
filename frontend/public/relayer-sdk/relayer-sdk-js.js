@@ -34325,7 +34325,7 @@ async function ac(i, t) {
   let e;
   typeof i < "u" && (Object.getPrototypeOf(i) === Object.prototype ? { module_or_path: i, memory: t, thread_stack_size: e } = i : console.warn("using deprecated parameters for the initialization function; pass a single object instead")), typeof i > "u" && (i = new URL(
     /* @vite-ignore */
-    "/tfhe_bg.wasm",
+    "/Confidential-voting/tfhe_bg.wasm",
     import.meta.url
   ));
   const r = L1();
@@ -35453,7 +35453,7 @@ async function Z1(i) {
   if (E !== void 0) return E;
   typeof i < "u" && (Object.getPrototypeOf(i) === Object.prototype ? { module_or_path: i } = i : console.warn("using deprecated parameters for the initialization function; pass a single object instead")), typeof i > "u" && (i = new URL(
     /* @vite-ignore */
-    "/kms_lib_bg.wasm",
+    "/Confidential-voting/kms_lib_bg.wasm",
     import.meta.url
   ));
   const t = dm();
