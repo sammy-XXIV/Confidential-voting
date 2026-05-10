@@ -18,8 +18,5 @@ export default defineConfig({
   },
   build: {
     target: "esnext",
-    rollupOptions: {
-      external: ["/relayer-sdk/relayer-sdk-js.js"],
-    },
   },
 });
