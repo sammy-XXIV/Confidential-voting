@@ -329,19 +329,70 @@ FHE.allowThis(handle);
 
 ## 7. Input Proofs
 
+### Why Input Proofs Exist
+
+When a user encrypts a value client-side and sends it to the contract, the contract receives a ciphertext it cannot read. Without additional verification, a malicious user could send a ciphertext that doesn't encrypt a valid integer — or replay someone else's ciphertext — and the contract would have no way to detect it.
+
+An **input proof** is a Zero-Knowledge Proof (ZKP) attached alongside the ciphertext. It proves three things without revealing the plaintext:
+
+1. **Well-formedness** — the ciphertext was correctly formed and encrypts a valid value of the claimed type
+2. **Ownership** — the ciphertext was encrypted specifically for this contract address and this user's address (bound during encryption client-side)
+3. **Freshness** — it was freshly generated, not replayed from another transaction or user
+
+`FHE.fromExternal(encryptedValue, inputProof)` verifies the ZKP on-chain before the ciphertext enters the FHE computation graph. If the proof is invalid, the transaction reverts. **Never skip this call** — accepting an unverified ciphertext lets attackers inject malformed values into your FHE state.
+
+### How It Works End-to-End
+
+```
+1. Frontend: user calls instance.createEncryptedInput(contractAddress, userAddress)
+   → SDK binds the encryption to this specific contract + user pair
+   → .add64(value).encrypt() returns { handles[], inputProof }
+
+2. Frontend: passes handles[0] and inputProof to the contract function
+
+3. Contract: FHE.fromExternal(encryptedValue, inputProof)
+   → verifies the ZKP (reverts if invalid)
+   → returns a trusted euint64 handle the contract can safely operate on
+```
+
+The binding to `contractAddress` and `userAddress` during encryption is what prevents replay attacks — a proof generated for contract A cannot be used on contract B, and a proof for Alice cannot be used by Bob.
+
+### Usage
+
 ```solidity
 function deposit(
     externalEuint64 encryptedAmount,
     bytes calldata inputProof
 ) external {
+    // Verifies ZKP — reverts if proof invalid or address binding wrong
     euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
-    // use amount in FHE operations
+    // amount is now a trusted, contract-internal encrypted handle
 }
 ```
 
-- Always validate via `FHE.fromExternal` — never skip
-- `externalEuint64` is for user-supplied inputs only
-- Internal `euint64` values cannot be passed as `externalEuint64`
+```javascript
+// Frontend — always pass both contractAddress AND userAddress
+const encrypted = await instance
+    .createEncryptedInput(
+        ethers.getAddress(CONTRACT_ADDRESS),  // binding: contract
+        ethers.getAddress(userAddress)        // binding: user
+    )
+    .add64(BigInt(amount))
+    .encrypt();
+
+// Both values must be sent to the contract
+const handle     = toHex(encrypted.handles[0]);
+const inputProof = toHex(encrypted.inputProof);
+await contract.deposit(handle, inputProof, { gasLimit: 1_000_000n });
+```
+
+### Rules
+
+- Always validate via `FHE.fromExternal` — never use an unverified ciphertext
+- `externalEuint64` is only for user-supplied inputs — internal `euint64` handles are already trusted
+- Never pass an internal `euint64` as `externalEuint64` — they are different types
+- The contract address and user address passed to `createEncryptedInput` must exactly match what the contract expects — checksum them with `ethers.getAddress()`
+- One `inputProof` can cover multiple encrypted inputs in the same call (call `.add64().add64().encrypt()` once, not twice)
 
 ---
 
