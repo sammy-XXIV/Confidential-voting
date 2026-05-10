@@ -22,12 +22,16 @@ const ABI = [
   "function hasVoted(address, uint256) external view returns (bool)",
   "function getTotalVoters(uint256) external view returns (uint256)",
   "function isVotingEnded(uint256) external view returns (bool)",
+  "function isDecryptionPending(uint256) external view returns (bool)",
   "function areResultsRevealed(uint256) external view returns (bool)",
+  "function getVotesForHandle(uint256) external view returns (bytes32)",
+  "function getVotesAgainstHandle(uint256) external view returns (bytes32)",
   "function getRevealedVotesFor(uint256) external view returns (uint64)",
   "function getRevealedVotesAgainst(uint256) external view returns (uint64)",
   "function castVote(uint256, bytes32, bytes) external",
   "function endVoting(uint256) external",
   "function revealResults(uint256) external",
+  "function submitDecryptionResult(uint256, bytes32[], bytes, bytes) external",
   "function createProposal(string) external",
 ];
 
@@ -343,24 +347,50 @@ export default function App() {
     }
   }
 
-  // ─── Owner: reveal results ─────────────────────────────────────────────────
-  // Results are stored as plaintext uint64 onchain after reveal
-  // No SDK decryption needed — read directly from contract
+  // ─── Owner: reveal results (two-step public KMS decryption) ───────────────
 
   async function revealResults(proposalId) {
-    showOverlay("Revealing Results…", "Storing tally onchain. This may take a few seconds.");
+    showOverlay("Step 1/3: Requesting Decryption…", "Marking tallies for public KMS decryption.");
     try {
-      const tx = await contractRef.current.revealResults(proposalId, { gasLimit: 1_000_000n });
-      await tx.wait();
-      hideOverlay();
-      addToast("success", "Results revealed!", "Reading tally from contract...");
+      const c = contractRef.current;
 
-      // Read plaintext results directly — no SDK decryption needed
+      // Step 1: contract marks tallies as publicly decryptable
+      const tx1 = await c.revealResults(proposalId, { gasLimit: 1_000_000n });
+      await tx1.wait();
+
+      showOverlay("Step 2/3: Decrypting via KMS…", "Fetching plaintext results from the FHE KMS. This may take 10–30 seconds.");
+
+      // Step 2: fetch handles, call publicDecrypt on KMS relayer
+      const [forHandle, againstHandle] = await Promise.all([
+        roContract.getVotesForHandle(proposalId),
+        roContract.getVotesAgainstHandle(proposalId),
+      ]);
+
+      const instance = await getFhevmInstance();
+      const result   = await instance.publicDecrypt([forHandle, againstHandle]);
+      // result: { clearValues, abiEncodedClearValues, decryptionProof }
+
+      showOverlay("Step 3/3: Submitting Proof…", "Writing verified plaintext results on-chain.");
+
+      // Step 3: submit proof on-chain — anyone can call this
+      const handlesList = [forHandle, againstHandle];
+      const tx2 = await c.submitDecryptionResult(
+        proposalId,
+        handlesList,
+        result.abiEncodedClearValues,
+        result.decryptionProof,
+        { gasLimit: 500_000n },
+      );
+      await tx2.wait();
+
+      hideOverlay();
+      addToast("success", "Results revealed!", "Plaintext tally is now on-chain.");
+
       const updated = await loadOneProposal(proposalId, accountRef.current);
       setProposals((prev) => prev.map((p) => (p.id === proposalId ? updated : p)));
     } catch (e) {
       hideOverlay();
-      addToast("error", "Transaction failed", e.message?.slice(0, 160));
+      addToast("error", "Reveal failed", e.message?.slice(0, 200));
     }
   }
 

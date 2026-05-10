@@ -5,7 +5,7 @@ import {FHE, euint64, externalEuint64, ebool} from "@fhevm/solidity/lib/FHE.sol"
 import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
 /// @title ConfidentialVoting
-/// @notice Voters cast encrypted ballots; the owner ends voting and reveals the final tally.
+/// @notice Voters cast encrypted ballots; the owner ends voting and triggers public KMS decryption.
 contract ConfidentialVoting is ZamaEthereumConfig {
     address public owner;
 
@@ -15,24 +15,25 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         euint64 votesAgainst;
         uint256 totalVoters;
         bool votingEnded;
+        bool decryptionPending;
         bool resultsRevealed;
+        uint64 revealedVotesFor;
+        uint64 revealedVotesAgainst;
     }
 
     uint256 public proposalCount;
 
-    // proposalId => Proposal
     mapping(uint256 => Proposal) private _proposals;
-    // voter => proposalId => voted
     mapping(address => mapping(uint256 => bool)) public hasVoted;
 
-    // Stored in constructor — never use FHE.asEuint64(0) inline (SKILL.md §4)
     euint64 private _encryptedZero;
     euint64 private _encryptedOne;
 
     event ProposalCreated(uint256 indexed proposalId, string name);
     event VoteCast(address indexed voter, uint256 indexed proposalId);
     event VotingEnded(uint256 indexed proposalId);
-    event ResultsRevealed(uint256 indexed proposalId);
+    event DecryptionRequested(uint256 indexed proposalId, bytes32 forHandle, bytes32 againstHandle);
+    event ResultsRevealed(uint256 indexed proposalId, uint64 votesFor, uint64 votesAgainst);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
@@ -47,7 +48,6 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         FHE.allowThis(_encryptedOne);
     }
 
-    /// @notice Owner creates a new proposal.
     function createProposal(string calldata name) external onlyOwner {
         uint256 id = proposalCount++;
         _proposals[id].name = name;
@@ -58,10 +58,6 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         emit ProposalCreated(id, name);
     }
 
-    /// @notice Cast an encrypted vote: 1 = for, 0 = against.
-    /// @param proposalId   Proposal to vote on.
-    /// @param encryptedVote  User-encrypted euint64 (1 = for, 0 = against).
-    /// @param inputProof   ZKP proof for the encrypted input.
     function castVote(
         uint256 proposalId,
         externalEuint64 encryptedVote,
@@ -73,11 +69,9 @@ contract ConfidentialVoting is ZamaEthereumConfig {
 
         euint64 vote = FHE.fromExternal(encryptedVote, inputProof);
 
-        // Interpret vote: non-zero → for, zero → against
         euint64 voteFor = FHE.select(FHE.ne(vote, _encryptedZero), _encryptedOne, _encryptedZero);
         euint64 voteAgainst = FHE.select(FHE.eq(vote, _encryptedZero), _encryptedOne, _encryptedZero);
 
-        // Re-grant after every FHE storage update (SKILL.md §20 — stale handle anti-pattern)
         _proposals[proposalId].votesFor = FHE.add(_proposals[proposalId].votesFor, voteFor);
         FHE.allowThis(_proposals[proposalId].votesFor);
 
@@ -90,7 +84,6 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         emit VoteCast(msg.sender, proposalId);
     }
 
-    /// @notice Owner closes voting on a proposal.
     function endVoting(uint256 proposalId) external onlyOwner {
         require(proposalId < proposalCount, "Invalid proposal");
         require(!_proposals[proposalId].votingEnded, "Already ended");
@@ -98,20 +91,61 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         emit VotingEnded(proposalId);
     }
 
-    /// @notice Owner reveals the final tally.
-    ///         Grants the owner FHE access to both encrypted counters so they can
-    ///         decrypt off-chain via EIP-712 userDecrypt.
+    /// @notice Step 1: owner marks both tallies for public KMS decryption.
+    ///         Emits handles so the frontend can request decryption from the KMS relayer.
     function revealResults(uint256 proposalId) external onlyOwner {
         require(proposalId < proposalCount, "Invalid proposal");
         require(_proposals[proposalId].votingEnded, "Voting still active");
+        require(!_proposals[proposalId].decryptionPending, "Decryption already pending");
         require(!_proposals[proposalId].resultsRevealed, "Already revealed");
 
-        // Grant owner decryption access to both tallies
-        FHE.allow(_proposals[proposalId].votesFor, msg.sender);
-        FHE.allow(_proposals[proposalId].votesAgainst, msg.sender);
+        euint64 forHandle = FHE.makePubliclyDecryptable(_proposals[proposalId].votesFor);
+        euint64 againstHandle = FHE.makePubliclyDecryptable(_proposals[proposalId].votesAgainst);
 
+        _proposals[proposalId].votesFor = forHandle;
+        _proposals[proposalId].votesAgainst = againstHandle;
+        _proposals[proposalId].decryptionPending = true;
+
+        emit DecryptionRequested(
+            proposalId,
+            euint64.unwrap(forHandle),
+            euint64.unwrap(againstHandle)
+        );
+    }
+
+    /// @notice Step 2: anyone submits the KMS decryption result on-chain.
+    ///         The contract verifies KMS signatures and stores plaintext tallies.
+    /// @param proposalId     Proposal whose tallies are being revealed.
+    /// @param handlesList    [forHandle, againstHandle] as bytes32 array (order must match abiEncodedCleartexts).
+    /// @param abiEncodedCleartexts  abi.encode(uint64 votesFor, uint64 votesAgainst).
+    /// @param decryptionProof       KMS proof returned by instance.publicDecrypt().
+    function submitDecryptionResult(
+        uint256 proposalId,
+        bytes32[] calldata handlesList,
+        bytes calldata abiEncodedCleartexts,
+        bytes calldata decryptionProof
+    ) external {
+        require(proposalId < proposalCount, "Invalid proposal");
+        require(_proposals[proposalId].decryptionPending, "Decryption not requested");
+        require(!_proposals[proposalId].resultsRevealed, "Already revealed");
+        require(handlesList.length == 2, "Expected 2 handles");
+
+        // Verify handles match what we stored
+        bytes32 forHandle = euint64.unwrap(_proposals[proposalId].votesFor);
+        bytes32 againstHandle = euint64.unwrap(_proposals[proposalId].votesAgainst);
+        require(handlesList[0] == forHandle && handlesList[1] == againstHandle, "Handle mismatch");
+
+        // Verify KMS signatures — reverts if invalid
+        FHE.checkSignatures(handlesList, abiEncodedCleartexts, decryptionProof);
+
+        (uint64 votesFor, uint64 votesAgainst) = abi.decode(abiEncodedCleartexts, (uint64, uint64));
+
+        _proposals[proposalId].revealedVotesFor = votesFor;
+        _proposals[proposalId].revealedVotesAgainst = votesAgainst;
+        _proposals[proposalId].decryptionPending = false;
         _proposals[proposalId].resultsRevealed = true;
-        emit ResultsRevealed(proposalId);
+
+        emit ResultsRevealed(proposalId, votesFor, votesAgainst);
     }
 
     // ─── View / getter functions ───────────────────────────────────────────
@@ -131,21 +165,36 @@ contract ConfidentialVoting is ZamaEthereumConfig {
         return _proposals[proposalId].votingEnded;
     }
 
+    function isDecryptionPending(uint256 proposalId) external view returns (bool) {
+        require(proposalId < proposalCount, "Invalid proposal");
+        return _proposals[proposalId].decryptionPending;
+    }
+
     function areResultsRevealed(uint256 proposalId) external view returns (bool) {
         require(proposalId < proposalCount, "Invalid proposal");
         return _proposals[proposalId].resultsRevealed;
     }
 
-    /// @notice Returns the encrypted votes-for handle after owner has revealed results.
-    ///         The returned bytes32 can be decrypted by the owner via EIP-712 userDecrypt.
-    function getRevealedVotesFor(uint256 proposalId) external view returns (euint64) {
-        require(_proposals[proposalId].resultsRevealed, "Results not yet revealed");
-        return _proposals[proposalId].votesFor;
+    /// @notice Returns the raw bytes32 handle for the for-tally (for use with publicDecrypt).
+    function getVotesForHandle(uint256 proposalId) external view returns (bytes32) {
+        require(proposalId < proposalCount, "Invalid proposal");
+        return euint64.unwrap(_proposals[proposalId].votesFor);
     }
 
-    /// @notice Returns the encrypted votes-against handle after owner has revealed results.
-    function getRevealedVotesAgainst(uint256 proposalId) external view returns (euint64) {
+    /// @notice Returns the raw bytes32 handle for the against-tally.
+    function getVotesAgainstHandle(uint256 proposalId) external view returns (bytes32) {
+        require(proposalId < proposalCount, "Invalid proposal");
+        return euint64.unwrap(_proposals[proposalId].votesAgainst);
+    }
+
+    /// @notice Returns the plaintext vote tally once results are revealed.
+    function getRevealedVotesFor(uint256 proposalId) external view returns (uint64) {
         require(_proposals[proposalId].resultsRevealed, "Results not yet revealed");
-        return _proposals[proposalId].votesAgainst;
+        return _proposals[proposalId].revealedVotesFor;
+    }
+
+    function getRevealedVotesAgainst(uint256 proposalId) external view returns (uint64) {
+        require(_proposals[proposalId].resultsRevealed, "Results not yet revealed");
+        return _proposals[proposalId].revealedVotesAgainst;
     }
 }

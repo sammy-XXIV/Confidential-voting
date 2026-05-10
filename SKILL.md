@@ -1541,34 +1541,15 @@ pnpm deploy:sepolia
 
 There are three related but distinct packages:
 
-| Package | Use case |
-|---------|----------|
-| `@zama-fhe/relayer-sdk` | Node.js backend — user decryption, encrypt for scripts |
-| `@fhevm/sdk` | React/browser frontend dApps |
-| `fhevmjs` | Old GitHub repo name — now published as `@zama-fhe/relayer-sdk` |
+| Package | Use case | Notes |
+|---------|----------|-------|
+| `@zama-fhe/relayer-sdk` | Node.js backend AND browser frontend | Use the pre-built bundle for browser — see Section 16 |
+| `@fhevm/sdk` | **DO NOT USE for browser** | v1.0.0-alpha.x exports are empty (`export {}`), API is `createFhevmClient` not `createInstance` |
+| `fhevmjs` | Old GitHub repo name | Now published as `@zama-fhe/relayer-sdk` |
 
-**For React frontend (fhevmjs / @fhevm/sdk):**
+**For browser frontend — use the pre-built bundle (see Section 16):**
 
-```bash
-npm install @fhevm/sdk
-```
-
-```typescript
-import { createInstance } from '@fhevm/sdk';
-import { BrowserProvider } from 'ethers';
-
-const provider = new BrowserProvider(window.ethereum);
-const instance = await createInstance({ provider });
-
-// Encrypt value
-const encrypted = await instance
-  .createEncryptedInput(contractAddress, userAddress)
-  .add64(BigInt(amount))
-  .encrypt();
-
-const handle     = encrypted.handles[0];
-const inputProof = encrypted.inputProof;
-```
+Do NOT `npm install @zama-fhe/relayer-sdk` and import it directly in Vite/React — WASM initialization fails at build time. Instead, use the pre-built bundle from `node_modules/@zama-fhe/relayer-sdk/lib/web.js` placed in `public/relayer-sdk/` with sed-patched WASM paths.
 
 **For Node.js backend (relayer-sdk):**
 
@@ -1664,59 +1645,135 @@ await wrappedUSDC.wrap(userAddress, amount);
 
 ---
 
-## 33. Public Decryption Pattern
+## 33. Public Decryption Pattern — CRITICAL (v0.11.1+)
 
-Different from user decryption. Used when the contract owner or a trusted party needs to decrypt a value publicly — not tied to a specific user's wallet signature.
+**WARNING: The Gateway callback pattern (`Gateway.requestDecryption` + `onlyGateway` callback) is OUTDATED and does NOT work in `@fhevm/solidity@0.11.1`.** The correct pattern uses `FHE.makePubliclyDecryptable()` + `FHE.checkSignatures()`.
+
+Different from user decryption. Used when results should be readable by **anyone** — vote tallies, auction outcomes, public scores.
 
 ### When to Use
 
-- Admin needs to read an encrypted total for reporting
-- Contract needs to reveal a result after a deadline (e.g. auction winner)
-- Verifiable public output after computation completes
+- Reveal vote tallies after voting ends
+- Reveal auction winner publicly
+- Any encrypted value that should become public after a trigger
 
-### Pattern
+### Correct Pattern (@fhevm/solidity@0.11.1)
+
+Two-step flow: contract marks handles → frontend fetches KMS decryption → contract verifies and stores plaintext.
+
+**Step 1: Contract marks tallies as publicly decryptable**
 
 ```solidity
-// Contract requests public decryption
-// The gateway decrypts and calls back a function on your contract
-
-import { IGateway } from "@fhevm/solidity/lib/FHE.sol";
+import {FHE, euint64, externalEuint64} from "@fhevm/solidity/lib/FHE.sol";
 
 contract MyContract is ZamaEthereumConfig {
-    uint64 public revealedValue;
     euint64 private _secret;
+    uint64  public  revealedValue;
+    bool    public  decryptionPending;
+    bool    public  resultsRevealed;
 
-    // Step 1: Request public decryption
-    function requestReveal() external {
-        uint256[] memory handles = new uint256[](1);
-        handles[0] = Gateway.toUint256(_secret);
-        Gateway.requestDecryption(
-            handles,
-            this.callbackReveal.selector,
-            0,           // msg.value for gateway fee
-            block.timestamp + 100,  // deadline
-            false        // not trustless
-        );
+    event DecryptionRequested(bytes32 handle);
+
+    // Owner triggers public decryption
+    function requestReveal() external onlyOwner {
+        require(!decryptionPending, "Already pending");
+        euint64 marked = FHE.makePubliclyDecryptable(_secret);
+        _secret = marked;
+        decryptionPending = true;
+        emit DecryptionRequested(euint64.unwrap(marked));
     }
 
-    // Step 2: Gateway calls this back with plaintext
-    function callbackReveal(
-        uint256 /*requestID*/,
-        uint64 decryptedValue
-    ) external onlyGateway {
-        revealedValue = decryptedValue;
+    // Get raw bytes32 handle for frontend to pass to publicDecrypt
+    function getSecretHandle() external view returns (bytes32) {
+        return euint64.unwrap(_secret);
+    }
+
+    // Anyone submits the KMS decryption result — FHE.checkSignatures verifies on-chain
+    function submitDecryptionResult(
+        bytes32[] calldata handlesList,
+        bytes calldata abiEncodedCleartexts,
+        bytes calldata decryptionProof
+    ) external {
+        require(decryptionPending, "Not pending");
+        require(!resultsRevealed, "Already revealed");
+
+        // Reverts if KMS signatures are invalid
+        FHE.checkSignatures(handlesList, abiEncodedCleartexts, decryptionProof);
+
+        (uint64 value) = abi.decode(abiEncodedCleartexts, (uint64));
+        revealedValue = value;
+        decryptionPending = false;
+        resultsRevealed = true;
     }
 }
 ```
+
+**Step 2: Frontend calls `instance.publicDecrypt()` then submits proof**
+
+```javascript
+// After requestReveal() tx confirms:
+const handle = await roContract.getSecretHandle(); // bytes32
+const result = await instance.publicDecrypt([handle]);
+// result: { clearValues, abiEncodedClearValues, decryptionProof }
+
+await contract.submitDecryptionResult(
+  [handle],
+  result.abiEncodedClearValues,
+  result.decryptionProof,
+  { gasLimit: 500_000n }
+);
+
+// Now revealedValue is readable by anyone
+const value = await roContract.revealedValue();
+```
+
+**Multiple values (e.g. for/against tallies):**
+
+```solidity
+// In contract — handle order must match abiEncodedCleartexts order
+function submitDecryptionResult(
+    bytes32[] calldata handlesList,   // [forHandle, againstHandle]
+    bytes calldata abiEncodedCleartexts,  // abi.encode(uint64, uint64)
+    bytes calldata decryptionProof
+) external {
+    FHE.checkSignatures(handlesList, abiEncodedCleartexts, decryptionProof);
+    (uint64 votesFor, uint64 votesAgainst) = abi.decode(abiEncodedCleartexts, (uint64, uint64));
+    // store...
+}
+```
+
+```javascript
+// Frontend — pass handles in same order as contract expects
+const [forHandle, againstHandle] = await Promise.all([
+  roContract.getVotesForHandle(proposalId),
+  roContract.getVotesAgainstHandle(proposalId),
+]);
+const result = await instance.publicDecrypt([forHandle, againstHandle]);
+await contract.submitDecryptionResult(
+  [forHandle, againstHandle],
+  result.abiEncodedClearValues,
+  result.decryptionProof
+);
+```
+
+### Key Rules
+
+- `FHE.makePubliclyDecryptable(handle)` returns the SAME euint64 — store the return value
+- `euint64.unwrap(handle)` gives the `bytes32` the frontend needs
+- `FHE.checkSignatures` reverts on bad signatures — no need for manual require
+- Handle order in `handlesList` must exactly match the order of values in `abiEncodedCleartexts`
+- `submitDecryptionResult` can be called by ANYONE — it's permissionless (KMS proof does the auth)
 
 ### Key Differences vs User Decryption
 
 | | User Decryption | Public Decryption |
 |--|----------------|-------------------|
-| Who decrypts | Individual user via EIP-712 | Gateway callback to contract |
-| Result | Returned to user only | Stored publicly onchain |
-| Use case | Show user their own balance | Reveal auction result, admin read |
-| Flow | Frontend signs → backend decrypts | Contract requests → gateway calls back |
+| Who decrypts | Individual user via EIP-712 wallet signature | KMS relayer, proof submitted on-chain |
+| Result | Returned to user only (private) | Stored publicly on-chain, readable by anyone |
+| Use case | Show user their own balance | Reveal vote tally, auction result |
+| Contract side | `FHE.allow(handle, userAddress)` | `FHE.makePubliclyDecryptable(handle)` |
+| Frontend SDK call | `instance.userDecrypt(...)` | `instance.publicDecrypt([handle1, handle2])` |
+| On-chain verification | None (off-chain only) | `FHE.checkSignatures(handlesList, cleartext, proof)` |
 
 ---
 
@@ -1892,7 +1949,69 @@ main().catch(console.error);
 
 ---
 
-## 36. Test File Template
+## 36. Deploying from Android / Termux — Remix IDE Required
+
+**Hardhat CANNOT compile or deploy on Android (Termux).** The `@nomicfoundation/edr` package requires a native binary (`edr-android-arm64`) that does not exist. Any `npx hardhat compile` or `npx hardhat run` will fail with:
+
+```
+Error: Cannot find module '@nomicfoundation/edr-android-arm64'
+```
+
+### Solution: Deploy via Remix IDE
+
+Use [remix.ethereum.org](https://remix.ethereum.org) from your mobile or desktop browser.
+
+**Step 1: Get a flattened contract**
+
+FHEVM contracts use npm imports (`@fhevm/solidity/...`). Remix needs raw GitHub URLs or a flattened file. Use these import substitutions for Remix:
+
+```solidity
+// Replace npm imports with raw GitHub URLs for Remix
+import "https://raw.githubusercontent.com/zama-ai/fhevm/refs/heads/main/lib/FHE.sol";
+import "https://raw.githubusercontent.com/zama-ai/fhevm/refs/heads/main/config/ZamaConfig.sol";
+```
+
+**Step 2: Compile in Remix**
+
+- Compiler tab → `0.8.24` → Enable optimization (200 runs)
+- EVM version: `cancun`
+- Click Compile
+
+**Step 3: Deploy**
+
+- Deploy tab → Environment: `Injected Provider - MetaMask`
+- Switch MetaMask to Sepolia
+- Click Deploy → confirm in MetaMask
+- Copy the deployed address from the Remix terminal
+
+**Step 4: Update frontend**
+
+```javascript
+// frontend/src/App.jsx or config.js
+const CONTRACT_ADDRESS = "0xYourNewAddress";
+```
+
+Then rebuild and redeploy the frontend (e.g. `npm run build` + push to GitHub Pages).
+
+### Workflow for Termux Developers
+
+```
+Write contract in Termux (VSCode/vim)
+    ↓
+Push to GitHub
+    ↓
+Open Remix → load from GitHub or paste contract
+    ↓
+Compile + Deploy via MetaMask on Sepolia
+    ↓
+Copy address → update frontend/src/App.jsx in Termux
+    ↓
+npm run build + gh push → GitHub Pages
+```
+
+---
+
+## 38. Test File Template
 
 Use this as the base for all FHEVM contract tests. Runs on local Hardhat network with mock encryption.
 
@@ -1972,168 +2091,370 @@ npx hardhat test test/ConfidentialVoting.test.ts
 
 ---
 
-## 37. Frontend Template (HTML + ethers.js)
+## 39. Frontend Template (React + Vite + ethers.js)
 
-Complete single-file frontend for any FHEVM contract. Shows encrypt → transact → decrypt flow.
+Use this as the base for all FHEVM dApp frontends. Built with React + Vite — the same stack as the official fhevm-react-template.
+
+### Setup
+
+```bash
+npm create vite@latest frontend -- --template react
+cd frontend
+npm install ethers
+npm install
+```
+
+### vite.config.js
+
+```javascript
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  base: './', // required for GitHub Pages
+})
+```
+
+### src/App.jsx — Complete FHEVM dApp Template
+
+```jsx
+import { useState, useEffect } from "react";
+import { BrowserProvider, Contract, ethers } from "ethers";
+
+const CONTRACT_ADDRESS = "0x..."; // your deployed contract
+const BACKEND_URL      = "https://your-backend.onrender.com";
+const CONTRACT_ABI = [
+  "function createProposal(string calldata description) external",
+  "function castVote(uint256 proposalId, bytes32 encryptedVote, bytes calldata inputProof) external",
+  "function revealResults(uint256 proposalId) external",
+  "function getProposal(uint256 id) external view returns (string, bool, uint256, uint256)",
+  "function proposalCount() external view returns (uint256)",
+  "function hasVoted(address, uint256) external view returns (bool)",
+  "function owner() external view returns (address)",
+];
+
+export default function App() {
+  const [provider, setProvider]   = useState(null);
+  const [signer, setSigner]       = useState(null);
+  const [contract, setContract]   = useState(null);
+  const [account, setAccount]     = useState("");
+  const [status, setStatus]       = useState("");
+  const [loading, setLoading]     = useState(false);
+  const [proposals, setProposals] = useState([]);
+  const [isOwner, setIsOwner]     = useState(false);
+  const [description, setDescription] = useState("");
+
+  // Wake backend on load
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/health`).catch(() => {});
+  }, []);
+
+  // ─── Connect Wallet ─────────────────────────────────────────
+  async function connectWallet() {
+    if (!window.ethereum) return setStatus("MetaMask not found");
+    try {
+      const _provider = new BrowserProvider(window.ethereum);
+      await _provider.send("eth_requestAccounts", []);
+
+      // Check network
+      const network = await _provider.getNetwork();
+      if (network.chainId !== 11155111n) {
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0xaa36a7" }],
+        });
+      }
+
+      const _signer   = await _provider.getSigner();
+      const _contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, _signer);
+      const _account  = await _signer.getAddress();
+      const _owner    = await _contract.owner();
+
+      setProvider(_provider);
+      setSigner(_signer);
+      setContract(_contract);
+      setAccount(_account);
+      setIsOwner(_account.toLowerCase() === _owner.toLowerCase());
+      setStatus("Connected: " + _account.slice(0, 6) + "..." + _account.slice(-4));
+
+      await loadProposals(_contract);
+    } catch (e) {
+      setStatus("Error: " + e.message);
+    }
+  }
+
+  // ─── Load Proposals ─────────────────────────────────────────
+  async function loadProposals(_contract) {
+    try {
+      const count = await _contract.proposalCount();
+      const list  = [];
+      for (let i = 0; i < Number(count); i++) {
+        const [desc, revealed, yesVotes, noVotes] = await _contract.getProposal(i);
+        list.push({ id: i, desc, revealed, yesVotes: Number(yesVotes), noVotes: Number(noVotes) });
+      }
+      setProposals(list);
+    } catch (e) {
+      setStatus("Error loading proposals: " + e.message);
+    }
+  }
+
+  // ─── Create Proposal ────────────────────────────────────────
+  async function createProposal() {
+    if (!contract || !description) return;
+    setLoading(true);
+    setStatus("Creating proposal...");
+    try {
+      const tx = await contract.createProposal(description, { gasLimit: 300_000n });
+      await tx.wait();
+      setDescription("");
+      setStatus("Proposal created!");
+      await loadProposals(contract);
+    } catch (e) {
+      setStatus("Error: " + e.message);
+    }
+    setLoading(false);
+  }
+
+  // ─── Cast Vote ───────────────────────────────────────────────
+  async function castVote(proposalId, vote) {
+    if (!contract || !account) return;
+    setLoading(true);
+    setStatus("Encrypting vote... (5-30 seconds)");
+    try {
+      // Encrypt vote via backend (1 = yes, 0 = no)
+      const res = await fetch(`${BACKEND_URL}/encrypt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: vote ? "1" : "0",
+          contractAddress: CONTRACT_ADDRESS,
+          userAddress: account,
+        }),
+      });
+      const { handle, inputProof, success, error } = await res.json();
+      if (!success) throw new Error(error);
+
+      setStatus("Sending encrypted vote...");
+      const tx = await contract.castVote(proposalId, handle, inputProof, { gasLimit: 1_000_000n });
+      setStatus("Vote sent! Waiting for confirmation...");
+      await tx.wait();
+      setStatus("Vote cast successfully!");
+      await loadProposals(contract);
+    } catch (e) {
+      setStatus("Error: " + e.message);
+    }
+    setLoading(false);
+  }
+
+  // ─── Reveal Results ──────────────────────────────────────────
+  async function revealResults(proposalId) {
+    if (!contract) return;
+    setLoading(true);
+    setStatus("Revealing results...");
+    try {
+      const tx = await contract.revealResults(proposalId, { gasLimit: 1_000_000n });
+      await tx.wait();
+      setStatus("Results revealed!");
+      await loadProposals(contract);
+    } catch (e) {
+      setStatus("Error: " + e.message);
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div style={{ maxWidth: 600, margin: "40px auto", padding: 20, fontFamily: "monospace" }}>
+      <h1>🔒 Confidential Voting</h1>
+      <p>Powered by Zama FHEVM — votes are encrypted onchain</p>
+
+      {!account ? (
+        <button onClick={connectWallet}>Connect Wallet</button>
+      ) : (
+        <p>✅ {account.slice(0,6)}...{account.slice(-4)} {isOwner && "(Owner)"}</p>
+      )}
+
+      <div style={{ background: "#f0f0f0", padding: 10, margin: "10px 0", minHeight: 40 }}>
+        {status || "Ready"}
+      </div>
+
+      {loading && <p>⏳ FHE operations take 5-30 seconds on Sepolia...</p>}
+
+      {isOwner && (
+        <div>
+          <h3>Create Proposal</h3>
+          <input
+            value={description}
+            onChange={e => setDescription(e.target.value)}
+            placeholder="Proposal description"
+            style={{ width: "70%", padding: 8 }}
+          />
+          <button onClick={createProposal} disabled={loading}>Create</button>
+        </div>
+      )}
+
+      <h3>Proposals</h3>
+      {proposals.length === 0 && <p>No proposals yet.</p>}
+      {proposals.map(p => (
+        <div key={p.id} style={{ border: "1px solid #ccc", padding: 10, margin: "10px 0" }}>
+          <strong>#{p.id}: {p.desc}</strong>
+          {p.revealed ? (
+            <p>✅ Yes: {p.yesVotes} | ❌ No: {p.noVotes}</p>
+          ) : (
+            <p>🔒 Votes encrypted — results hidden</p>
+          )}
+          {account && !p.revealed && (
+            <div>
+              <button onClick={() => castVote(p.id, true)} disabled={loading}>Vote Yes</button>
+              <button onClick={() => castVote(p.id, false)} disabled={loading}>Vote No</button>
+            </div>
+          )}
+          {isOwner && !p.revealed && (
+            <button onClick={() => revealResults(p.id)} disabled={loading}>Reveal Results</button>
+          )}
+        </div>
+      ))}
+
+      <button onClick={() => loadProposals(contract)} disabled={!contract}>Refresh</button>
+    </div>
+  );
+}
+```
+
+### src/main.jsx
+
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+```
+
+### index.html
 
 ```html
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>FHEVM dApp</title>
-  <script src="https://cdn.jsdelivr.net/npm/ethers@6.7.0/dist/ethers.umd.min.js"></script>
-  <style>
-    body { font-family: monospace; max-width: 600px; margin: 40px auto; padding: 20px; }
-    button { padding: 10px 20px; margin: 5px; cursor: pointer; }
-    #status { margin: 10px 0; padding: 10px; background: #f0f0f0; min-height: 40px; }
-  </style>
-</head>
-<body>
-  <h2>FHEVM dApp</h2>
-  <div id="status">Not connected</div>
-
-  <button onclick="connectWallet()">Connect Wallet</button>
-  <button onclick="encrypt()">Encrypt Input</button>
-  <button onclick="sendTx()">Send Transaction</button>
-  <button onclick="decryptBalance()">Decrypt Balance</button>
-
-  <script>
-    const CONTRACT_ADDRESS = "0x..."; // your deployed contract
-    const BACKEND_URL      = "https://your-backend.onrender.com";
-    const CONTRACT_ABI = [
-      "function deposit(bytes32 encryptedAmount, bytes inputProof) external",
-      "function getBalanceHandle(address user) external returns (bytes32)",
-      "function hasDeposit(address) external view returns (bool)",
-    ];
-
-    let provider, signer, contract;
-    let encryptedHandle, encryptedProof;
-
-    function log(msg) {
-      document.getElementById("status").innerText = msg;
-      console.log(msg);
-    }
-
-    // ─── Connect Wallet ──────────────────────────────────────────
-    async function connectWallet() {
-      if (!window.ethereum) return log("MetaMask not found");
-      provider = new ethers.BrowserProvider(window.ethereum);
-      await provider.send("eth_requestAccounts", []);
-      signer   = await provider.getSigner();
-      contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      log("Connected: " + await signer.getAddress());
-    }
-
-    // ─── Encrypt Input via Backend ───────────────────────────────
-    async function encrypt() {
-      const amount  = document.getElementById("amount")?.value || "100";
-      const address = await signer.getAddress();
-      log("Encrypting...");
-
-      // Wake backend first
-      await fetch(`${BACKEND_URL}/health`).catch(() => {});
-
-      const res  = await fetch(`${BACKEND_URL}/encrypt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          amount,
-          contractAddress: CONTRACT_ADDRESS,
-          userAddress: address,
-        }),
-      });
-      const data = await res.json();
-      if (!data.success) return log("Encrypt failed: " + data.error);
-
-      encryptedHandle = data.handle;
-      encryptedProof  = data.inputProof;
-      log("Encrypted. Handle: " + encryptedHandle.slice(0, 18) + "...");
-    }
-
-    // ─── Send Transaction ────────────────────────────────────────
-    async function sendTx() {
-      if (!encryptedHandle) return log("Encrypt first");
-      log("Sending transaction... (FHE takes 5-30 seconds)");
-      try {
-        const tx = await contract.deposit(
-          encryptedHandle,
-          encryptedProof,
-          { gasLimit: 1_000_000n }
-        );
-        log("Tx sent: " + tx.hash);
-        await tx.wait();
-        log("Confirmed: " + tx.hash);
-      } catch (e) {
-        log("Error: " + e.message);
-      }
-    }
-
-    // ─── Decrypt Balance ─────────────────────────────────────────
-    async function decryptBalance() {
-      const address = await signer.getAddress();
-      log("Getting balance handle...");
-
-      // Get encrypted handle from contract
-      const handle = await contract.getBalanceHandle.staticCall(address);
-      log("Got handle. Preparing decrypt...");
-
-      // Step 1: Get EIP-712 from backend
-      const prepRes = await fetch(`${BACKEND_URL}/decrypt-prepare`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          handle,
-          contractAddress: CONTRACT_ADDRESS,
-          userAddress: address,
-        }),
-      });
-      const prep = await prepRes.json();
-      if (!prep.success) return log("Decrypt prepare failed: " + prep.error);
-
-      // Step 2: Sign EIP-712
-      log("Please sign the decrypt request in your wallet...");
-      const { domain, types: allTypes, message } = prep.eip712;
-      const { EIP712Domain: _, ...signTypes } = allTypes;
-      const signature = await signer.signTypedData(
-        { ...domain, chainId: Number(domain.chainId) },
-        signTypes,
-        message
-      );
-
-      // Step 3: Decrypt via backend
-      const decRes = await fetch(`${BACKEND_URL}/decrypt-balance`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          handle,
-          contractAddress: CONTRACT_ADDRESS,
-          userAddress: address,
-          signature,
-          keypair:        prep.keypair,
-          startTimestamp: prep.startTimestamp,
-          durationDays:   prep.durationDays,
-        }),
-      });
-      const dec = await decRes.json();
-      if (!dec.success) return log("Decrypt failed: " + dec.error);
-
-      const display = parseFloat(
-        ethers.formatUnits(dec.balance, 8) // cWETH = 8 decimals
-      ).toFixed(4);
-      log("Your balance: " + display + " cWETH");
-    }
-  </script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Confidential Voting — FHEVM</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
 </html>
+```
+
+### Build and Deploy
+
+```bash
+cd frontend
+npm run build
+# dist/ folder is ready for GitHub Pages
 ```
 
 ### Key Points for AI Agents
 
+- Always set `base: './'` in `vite.config.js` for GitHub Pages
 - Always wake backend with `/health` before encrypt — Render cold start takes 30-60s
-- Always set `gasLimit: 1_000_000n` explicitly — never rely on gas estimation
+- Always set explicit `gasLimit` — never rely on estimation
 - FHE transactions take 5-30 seconds — show loading state
-- `getBalanceHandle` must use `staticCall` — it modifies state but returns a value
-- `chainId` must be `Number` not BigInt for EIP-712 signing
-- Strip `0x` from signature before sending to backend
+- Check network is Sepolia (chainId 11155111) before any transaction
+- `CONTRACT_ADDRESS` and `BACKEND_URL` must be updated after deployment
+
+---
+
+## 16. Frontend Deployment — GitHub Pages WASM Path Fix
+
+### The Problem
+
+`@zama-fhe/relayer-sdk` hardcodes WASM fetch paths as absolute URLs:
+
+```js
+"/tfhe_bg.wasm"
+"/kms_lib_bg.wasm"
+```
+
+These resolve to the **origin root** (`https://user.github.io/tfhe_bg.wasm`).
+GitHub Pages project sites live at a **subdirectory** (`https://user.github.io/repo/`).
+The WASM files are in `dist/` which maps to `https://user.github.io/repo/tfhe_bg.wasm`.
+Result: **404 → "Failed to execute 'compile' on 'WebAssembly': HTTP status code is not ok"**
+
+Patching `window.fetch` in the main thread does NOT fix this — WASM is loaded inside a Web Worker where the patch doesn't reach.
+
+### The Fix — Edit the Pre-built Bundle
+
+Do a targeted string replacement in the pre-built bundle before committing it:
+
+```bash
+# Replace with your actual repo/subdirectory name
+sed -i 's|"/tfhe_bg.wasm"|"/your-repo-name/tfhe_bg.wasm"|g' frontend/public/relayer-sdk/relayer-sdk-js.js
+sed -i 's|"/kms_lib_bg.wasm"|"/your-repo-name/kms_lib_bg.wasm"|g' frontend/public/relayer-sdk/relayer-sdk-js.js
+```
+
+Verify: `grep -c "your-repo-name" frontend/public/relayer-sdk/relayer-sdk-js.js` should return `2`.
+
+For Vercel / Netlify / root-domain hosting, the paths are correct as-is — no fix needed.
+
+### sdk-bundle.js — Always Required, Never Auto-generated
+
+The `App.jsx` pattern `await import('./sdk-bundle.js')` requires this file to exist in `src/`. It is **never created automatically** by any package or build tool. Always create it manually:
+
+```js
+// frontend/src/sdk-bundle.js
+const sdkUrl = new URL("../relayer-sdk/relayer-sdk-js.js", import.meta.url).href;
+const mod = await import(sdkUrl);
+
+export const createInstance = mod.createInstance;
+export const SepoliaConfig  = mod.SepoliaConfig;
+export const initSDK        = mod.initSDK;
+```
+
+Key points:
+- Use `new URL("...", import.meta.url).href` for the SDK path — resolves correctly regardless of base URL or subdirectory
+- Do NOT use absolute paths like `"/relayer-sdk/relayer-sdk-js.js"` — Rollup will fail to resolve them at build time
+- Do NOT use `/* @vite-ignore */` with `vite-plugin-top-level-await` — the comment is stripped before Rollup sees it
+- `import.meta.url` in the compiled `dist/assets/sdk-bundle-[hash].js` resolves relative to the actual deployed URL
+
+### Vite Config Requirements
+
+```js
+export default defineConfig({
+  base: './',          // required for GitHub Pages subdirectory
+  build: {
+    target: 'esnext', // required for top-level await in sdk-bundle.js
+  },
+});
+```
+
+### WASM Files Location
+
+Place the pre-built bundle and WASM files in `public/`:
+
+```
+frontend/public/
+  tfhe_bg.wasm          ← served at /repo/tfhe_bg.wasm (after bundle path fix)
+  kms_lib_bg.wasm       ← served at /repo/kms_lib_bg.wasm (after bundle path fix)
+  relayer-sdk/
+    relayer-sdk-js.js   ← the pre-built SDK bundle
+    workerHelpers.js    ← required for Web Worker WASM loading
+```
+
+Do NOT place WASM files in `src/` — Vite will try to process them. Keep them in `public/`.
+
+### SDK Package Confusion
+
+The SKILL.md table above says `@fhevm/sdk` is for React/browser. This is outdated for v1.0.0-alpha. In practice:
+
+- `@fhevm/sdk@1.0.0-alpha.x` — exports are empty (`export {}`), API is `createFhevmClient` not `createInstance`
+- `@zama-fhe/relayer-sdk` — has `"browser": "lib/web.js"` field, exports `createInstance` + `SepoliaConfig` + `initSDK`, works in browser via the pre-built bundle approach above
+
+Use the **pre-built bundle** (`relayer-sdk-js.js`) for browser apps, not direct npm imports. Vite cannot reliably handle the WASM initialization when importing `@zama-fhe/relayer-sdk` directly as an npm dependency.
 
