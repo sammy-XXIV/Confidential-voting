@@ -100,8 +100,10 @@ function ProposalCard({ p, account, isOwner, onVoteFor, onVoteAgainst, onEndVoti
     } else {
       resultsSection = (
         <div className="results-section">
-          <div className="vote-label">Results Revealed</div>
-          <p className="decrypt-note">Loading tally from contract...</p>
+          <div className="vote-label">✅ Voting Complete</div>
+          <p className="decrypt-note" style={{ color: "var(--green)", margin: 0 }}>
+            Results have been revealed on-chain.
+          </p>
         </div>
       );
     }
