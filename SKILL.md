@@ -2091,7 +2091,350 @@ npx hardhat test test/ConfidentialVoting.test.ts
 
 ---
 
-## 39. Frontend Template (React + Vite + ethers.js)
+## 39. Standalone HTML Template (No Build Step)
+
+Use this when you want a single `.html` file that works without React, Vite, or npm. Good for quick prototyping or deploying a minimal dApp directly to GitHub Pages.
+
+### Required File Structure
+
+```
+your-repo/
+  index.html              ← this template
+  tfhe_bg.wasm            ← copy from node_modules/@zama-fhe/relayer-sdk/lib/
+  kms_lib_bg.wasm         ← copy from node_modules/@zama-fhe/relayer-sdk/lib/
+  relayer-sdk/
+    relayer-sdk-js.js     ← sed-patched bundle (see Section 16)
+    workerHelpers.js      ← copy from node_modules/@zama-fhe/relayer-sdk/lib/
+```
+
+**WASM path patch (must match your GitHub Pages subdirectory):**
+```bash
+sed -i 's|"/tfhe_bg.wasm"|"/your-repo-name/tfhe_bg.wasm"|g' relayer-sdk/relayer-sdk-js.js
+sed -i 's|"/kms_lib_bg.wasm"|"/your-repo-name/kms_lib_bg.wasm"|g' relayer-sdk/relayer-sdk-js.js
+```
+
+### index.html
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Confidential Voting — FHEVM</title>
+  <style>
+    body { font-family: monospace; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #a78bfa; }
+    button { background: #7c3aed; color: #fff; border: none; padding: 8px 16px; cursor: pointer; border-radius: 4px; margin: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input  { background: #1e1e1e; color: #e0e0e0; border: 1px solid #444; padding: 8px; width: 100%; box-sizing: border-box; border-radius: 4px; margin: 4px 0; }
+    .card  { border: 1px solid #333; border-radius: 8px; padding: 16px; margin: 12px 0; background: #1a1a1a; }
+    .status { background: #1e1e1e; padding: 10px; border-radius: 4px; margin: 8px 0; min-height: 36px; font-size: 13px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .badge-active   { background: #064e3b; color: #34d399; }
+    .badge-ended    { background: #1c1917; color: #a8a29e; }
+    .badge-revealed { background: #1e1b4b; color: #a78bfa; }
+    .overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); place-items:center; }
+    .overlay.show { display:grid; }
+    .modal { background:#1a1a1a; border:1px solid #333; border-radius:12px; padding:32px; text-align:center; max-width:360px; }
+    .spinner { width:40px; height:40px; border:3px solid #333; border-top-color:#7c3aed; border-radius:50%; animation:spin 1s linear infinite; margin:0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<h1>🔒 Confidential Voting</h1>
+<p>Powered by Zama FHEVM · Sepolia</p>
+
+<div>
+  <button id="connectBtn">Connect Wallet</button>
+  <span id="walletInfo"></span>
+</div>
+
+<div class="status" id="status">Not connected</div>
+
+<div id="ownerPanel" style="display:none" class="card">
+  <strong>Owner — Create Proposal</strong><br><br>
+  <input id="proposalName" placeholder="e.g. Should we upgrade the protocol?" maxlength="120" />
+  <button id="createBtn">+ Create</button>
+</div>
+
+<div id="proposals"></div>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="spinner"></div>
+    <div id="overlayTitle" style="font-weight:bold;margin-bottom:8px"></div>
+    <div id="overlayMsg" style="color:#aaa;font-size:13px"></div>
+  </div>
+</div>
+
+<!-- ethers v6 from CDN -->
+<script type="module">
+import { BrowserProvider, Contract, ethers } from
+  'https://cdn.jsdelivr.net/npm/ethers@6.13.0/dist/ethers.min.js';
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+const CONTRACT_ADDRESS = '0xYOUR_CONTRACT_ADDRESS';  // ← replace after deploy
+const SEPOLIA_CHAIN_ID = 11155111;
+
+const ABI = [
+  'function owner() external view returns (address)',
+  'function proposalCount() external view returns (uint256)',
+  'function getProposalName(uint256) external view returns (string)',
+  'function getTotalVoters(uint256) external view returns (uint256)',
+  'function isVotingEnded(uint256) external view returns (bool)',
+  'function isDecryptionPending(uint256) external view returns (bool)',
+  'function areResultsRevealed(uint256) external view returns (bool)',
+  'function getVotesForHandle(uint256) external view returns (bytes32)',
+  'function getVotesAgainstHandle(uint256) external view returns (bytes32)',
+  'function getRevealedVotesFor(uint256) external view returns (uint64)',
+  'function getRevealedVotesAgainst(uint256) external view returns (uint64)',
+  'function hasVoted(address, uint256) external view returns (bool)',
+  'function castVote(uint256, bytes32, bytes) external',
+  'function endVoting(uint256) external',
+  'function revealResults(uint256) external',
+  'function submitDecryptionResult(uint256, bytes32[], bytes, bytes) external',
+  'function createProposal(string) external',
+];
+
+// ─── SDK (pre-built bundle — top-level await requires type="module") ──────────
+const sdkUrl = new URL('./relayer-sdk/relayer-sdk-js.js', import.meta.url).href;
+const sdk    = await import(sdkUrl);
+const { createInstance, SepoliaConfig, initSDK } = sdk;
+if (initSDK) await initSDK();
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let account  = '';
+let signer   = null;
+let contract = null;
+let isOwner  = false;
+let fhevmInstance = null;
+
+const roProvider = new ethers.JsonRpcProvider('https://ethereum-sepolia-rpc.publicnode.com');
+const roContract = new Contract(CONTRACT_ADDRESS, ABI, roProvider);
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const setStatus = msg => { $('status').textContent = msg; };
+const showOverlay = (title, msg) => {
+  $('overlayTitle').textContent = title;
+  $('overlayMsg').textContent   = msg;
+  $('overlay').classList.add('show');
+};
+const hideOverlay = () => $('overlay').classList.remove('show');
+
+async function getFhevmInstance() {
+  if (fhevmInstance) return fhevmInstance;
+  fhevmInstance = await createInstance({
+    ...SepoliaConfig,
+    network: 'https://ethereum-sepolia-rpc.publicnode.com',
+  });
+  return fhevmInstance;
+}
+
+function toHex(val) {
+  if (typeof val === 'string' && val.startsWith('0x')) return val;
+  if (val instanceof Uint8Array || Array.isArray(val))
+    return '0x' + Array.from(val).map(b => b.toString(16).padStart(2,'0')).join('');
+  return String(val);
+}
+
+// ─── Connect Wallet ───────────────────────────────────────────────────────────
+$('connectBtn').onclick = async () => {
+  if (!window.ethereum) return setStatus('MetaMask not found. Install it first.');
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    await setupWallet(accounts[0]);
+  } catch (e) { setStatus('Connect failed: ' + e.message); }
+};
+
+async function setupWallet(addr) {
+  const provider = new BrowserProvider(window.ethereum);
+  const network  = await provider.getNetwork();
+  if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
+    await window.ethereum.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: '0xaa36a7' }],
+    });
+  }
+  signer   = await provider.getSigner();
+  contract = new Contract(CONTRACT_ADDRESS, ABI, signer);
+  account  = addr;
+  const owner = await roContract.owner();
+  isOwner  = addr.toLowerCase() === owner.toLowerCase();
+  fhevmInstance = null;
+
+  $('connectBtn').textContent = addr.slice(0,6) + '…' + addr.slice(-4);
+  $('connectBtn').disabled = true;
+  $('ownerPanel').style.display = isOwner ? 'block' : 'none';
+  setStatus('Connected' + (isOwner ? ' (Owner)' : ''));
+  await loadProposals();
+}
+
+// ─── Load Proposals ───────────────────────────────────────────────────────────
+async function loadProposals() {
+  setStatus('Loading proposals…');
+  const count = Number(await roContract.proposalCount());
+  const list  = await Promise.all(
+    Array.from({ length: count }, (_, i) => loadOne(i))
+  );
+  renderProposals(list);
+  setStatus(count ? `${count} proposal(s) loaded.` : 'No proposals yet.');
+}
+
+async function loadOne(id) {
+  const [name, total, ended, revealed, voted] = await Promise.all([
+    roContract.getProposalName(id),
+    roContract.getTotalVoters(id),
+    roContract.isVotingEnded(id),
+    roContract.areResultsRevealed(id),
+    account ? roContract.hasVoted(account, id) : Promise.resolve(false),
+  ]);
+  let vFor = null, vAgainst = null;
+  if (revealed) {
+    [vFor, vAgainst] = await Promise.all([
+      roContract.getRevealedVotesFor(id),
+      roContract.getRevealedVotesAgainst(id),
+    ]);
+  }
+  return { id, name, total: Number(total), ended, revealed, voted, vFor, vAgainst };
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+function renderProposals(list) {
+  const el = $('proposals');
+  el.innerHTML = list.length ? '' : '<p style="color:#666">No proposals yet.</p>';
+  list.forEach(p => {
+    const badge = p.revealed ? `<span class="badge badge-revealed">Revealed</span>`
+                : p.ended    ? `<span class="badge badge-ended">Ended</span>`
+                             : `<span class="badge badge-active">Active</span>`;
+
+    let results = '';
+    if (p.revealed && p.vFor !== null) {
+      const t = Number(p.vFor) + Number(p.vAgainst) || 1;
+      results = `
+        <div style="margin-top:10px">
+          <div>✅ For: ${p.vFor} (${Math.round(Number(p.vFor)/t*100)}%)</div>
+          <div>❌ Against: ${p.vAgainst} (${Math.round(Number(p.vAgainst)/t*100)}%)</div>
+        </div>`;
+    }
+
+    const voteRow = !p.ended && !p.voted && account ? `
+      <div style="margin-top:10px">
+        <button onclick="castVote(${p.id}, 1n)">👍 Vote For</button>
+        <button onclick="castVote(${p.id}, 0n)">👎 Vote Against</button>
+      </div>` : (p.voted ? '<div style="margin-top:8px;color:#6ee7b7">✓ You voted</div>' : '');
+
+    const ownerRow = isOwner && !p.ended ? `<button onclick="endVoting(${p.id})" style="background:#b91c1c;margin-top:8px">⏹ End Voting</button>`
+      : isOwner && p.ended && !p.revealed ? `<button onclick="revealResults(${p.id})" style="background:#5b21b6;margin-top:8px">🔓 Reveal Results</button>` : '';
+
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>${p.name}</strong>${badge}
+      </div>
+      <div style="color:#666;font-size:12px;margin-top:4px">${p.total} voter(s)</div>
+      ${results}${voteRow}${ownerRow}`;
+    el.appendChild(div);
+  });
+}
+
+// ─── Cast Vote ────────────────────────────────────────────────────────────────
+window.castVote = async (proposalId, voteValue) => {
+  showOverlay('Encrypting Vote…', 'Creating FHE-encrypted ballot. Takes a few seconds.');
+  try {
+    const instance  = await getFhevmInstance();
+    const encrypted = await instance
+      .createEncryptedInput(ethers.getAddress(CONTRACT_ADDRESS), ethers.getAddress(account))
+      .add64(voteValue)
+      .encrypt();
+
+    const handle     = toHex(encrypted.handles[0]);
+    const inputProof = toHex(encrypted.inputProof);
+
+    showOverlay('Sending Transaction…', 'FHE ops on Sepolia take 5–30 seconds.');
+    const tx = await contract.castVote(proposalId, handle, inputProof, { gasLimit: 1_000_000n });
+    await tx.wait();
+    hideOverlay();
+    setStatus('Vote cast! ✅');
+    await loadProposals();
+  } catch (e) {
+    hideOverlay();
+    setStatus('Vote failed: ' + (e.code === 'ACTION_REJECTED' ? 'Rejected.' : e.message?.slice(0,120)));
+  }
+};
+
+// ─── End Voting ───────────────────────────────────────────────────────────────
+window.endVoting = async (proposalId) => {
+  showOverlay('Ending Voting…', 'Closing the proposal.');
+  try {
+    await (await contract.endVoting(proposalId, { gasLimit: 200_000n })).wait();
+    hideOverlay(); setStatus('Voting ended.'); await loadProposals();
+  } catch (e) { hideOverlay(); setStatus('Failed: ' + e.message?.slice(0,120)); }
+};
+
+// ─── Reveal Results (two-step public KMS decryption) ─────────────────────────
+window.revealResults = async (proposalId) => {
+  showOverlay('Step 1/3: Requesting Decryption…', 'Marking tallies for public KMS decryption.');
+  try {
+    await (await contract.revealResults(proposalId, { gasLimit: 1_000_000n })).wait();
+
+    showOverlay('Step 2/3: Decrypting via KMS…', 'Fetching plaintext from FHE KMS. 10–30 seconds.');
+    const [forHandle, againstHandle] = await Promise.all([
+      roContract.getVotesForHandle(proposalId),
+      roContract.getVotesAgainstHandle(proposalId),
+    ]);
+    const instance = await getFhevmInstance();
+    const result   = await instance.publicDecrypt([forHandle, againstHandle]);
+
+    showOverlay('Step 3/3: Submitting Proof…', 'Writing verified results on-chain.');
+    await (await contract.submitDecryptionResult(
+      proposalId,
+      [forHandle, againstHandle],
+      result.abiEncodedClearValues,
+      result.decryptionProof,
+      { gasLimit: 500_000n }
+    )).wait();
+
+    hideOverlay(); setStatus('Results revealed! ✅'); await loadProposals();
+  } catch (e) { hideOverlay(); setStatus('Reveal failed: ' + e.message?.slice(0,160)); }
+};
+
+// ─── Create Proposal ──────────────────────────────────────────────────────────
+$('createBtn').onclick = async () => {
+  const name = $('proposalName').value.trim();
+  if (!name) return setStatus('Enter a proposal name first.');
+  showOverlay('Creating Proposal…', 'Sending transaction.');
+  try {
+    await (await contract.createProposal(name, { gasLimit: 300_000n })).wait();
+    $('proposalName').value = '';
+    hideOverlay(); setStatus(`Proposal "${name}" created!`); await loadProposals();
+  } catch (e) { hideOverlay(); setStatus('Failed: ' + e.message?.slice(0,120)); }
+};
+
+// Auto-connect if already authorized
+if (window.ethereum) {
+  const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+  if (accounts.length) await setupWallet(accounts[0]);
+}
+</script>
+</body>
+</html>
+```
+
+### Key Points
+
+- Script must be `type="module"` — required for top-level await (SDK bundle uses it)
+- SDK loaded via `new URL('./relayer-sdk/relayer-sdk-js.js', import.meta.url).href` — resolves correctly on GitHub Pages subdirectories
+- `window.castVote` / `window.revealResults` etc. are attached to `window` so inline `onclick` attributes can call them from module scope
+- WASM files must be sed-patched for the repo subdirectory (see Section 16) — this is the most common failure point
+- ethers loaded from CDN (`cdn.jsdelivr.net/npm/ethers@6.13.0`) — no npm needed
+
+---
+
+## 40. Frontend Template (React + Vite + ethers.js)
 
 Use this as the base for all FHEVM dApp frontends. Built with React + Vite — the same stack as the official fhevm-react-template.
 
