@@ -16,9 +16,6 @@ export default defineConfig({
     format: "es",
     plugins: () => [wasm(), topLevelAwait()],
   },
-  optimizeDeps: {
-    exclude: ["@zama-fhe/relayer-sdk"],
-  },
   build: {
     target: "esnext",
   },
